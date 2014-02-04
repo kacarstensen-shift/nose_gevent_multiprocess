@@ -401,8 +401,8 @@ class TestProcessorTaskRunner(BaseTaskRunner):
         :return: tuple of (test_address, pickle_serialized_result_parts_string)
         :rtype: tuple
         """
-        test_address, result = task_result
-        return test_address, pickle.dumps(unpack_result_object(result))
+        test_address, result, execution_time_s = task_result
+        return test_address, pickle.dumps(unpack_result_object(result)), execution_time_s
 
     def process_task(self, task, *args, **kwargs):
         """
@@ -419,6 +419,8 @@ class TestProcessorTaskRunner(BaseTaskRunner):
 
         logging.info("Worker runs test %s '%s'" % (self.worker_id, test_addr))
 
+        start_time_s = time.time()
+
         try:
 
             # TODO: figure out what this is about:
@@ -426,7 +428,7 @@ class TestProcessorTaskRunner(BaseTaskRunner):
                 test_addr = test_addr + str(arg)
 
             test(result)
-            return test_addr, result
+            return test_addr, result, (time.time()- start_time_s)
 
         #except KeyboardInterrupt as e: #TimedOutException:
         #    timeout = isinstance(e, TimedOutException)
@@ -459,7 +461,7 @@ class TestProcessorTaskRunner(BaseTaskRunner):
 
         except:
             failure.Failure(*sys.exc_info())(result)
-            return test_addr, result
+            return test_addr, result, (time.time() - start_time_s)
 
 
 def start_task_runner(worker_id, server_port, *args, **kwargs):
@@ -571,6 +573,8 @@ class TestsQueueManager(TasksQueueManager):
         self.loader_class = loader_class
         self.results_class = result_class
         self.config = config
+        self.timing = {} # test_address => # of seconds to execute
+        # e.g., '/Users/kacarstensen/Documents/work/grahpeffect-api/ge/facebook/tests/bar.py' => 3
 
         self['get_setup_objects'] = self._get_nose_set_up_objects
 
@@ -592,8 +596,12 @@ class TestsQueueManager(TasksQueueManager):
             except gevent.queue.Empty:
                 break
 
-            test_address, serialized_result_object = test_run_results_tuple
-            batch_result = pickle.loads(serialized_result_object)
+            if len(test_run_results_tuple) == 3:
+                test_address, serialized_result_object, execution_time_s = test_run_results_tuple
+            else:
+                test_address, serialized_result_object = test_run_results_tuple
+
+            batch_result = pickle.loads(str(serialized_result_object))
 
             sys.stdout.write('Results received for worker %d, %s\n' % (worker_id, test_address))
 
@@ -611,6 +619,8 @@ class TestsQueueManager(TasksQueueManager):
             #    completed_tasks.append((test_address, batch_result))
 
             #remaining_tasks.extend(more_task_addresses)
+
+            self.timing[test_address] = int(execution_time_s)
 
             output = consolidate_batch_results(global_result, batch_result)
             if output and output_stream:
@@ -779,6 +789,19 @@ class GeventedMultiProcess(Plugin):
                 "testing. Default is 0 unless NOSE_GEVENTED_PROCESSES is "
                 "set. "
                 "[NOSE_GEVENTED_PROCESSES]")
+        parser.add_option(
+            "--time-scheduling",
+            action="store_true",
+            dest="time_scheduling",
+            default=False,
+            help="Use previously observed execution times to help "
+                 "schedule tests efficiently.")
+        parser.add_option(
+            "--timing-data-file",
+            action="store",
+            default=".nose_timing",
+            dest="timing_data_file",
+            help="Store timing data in this file.")
 
     def configure(self, options, config):
         """
@@ -891,7 +914,17 @@ class GeventedMultiProcessTestRunner(TextTestRunner):
             test_addr = add_task_to_queue(case, tasks_queue, tasks_list)
             log.debug("Queued test %s (%s)", len(tasks_list), test_addr)
 
-        self.stream.write(" Found %s test cases\n" % len(tasks_queue))
+        def comparator(x, y):
+            timing_x = self.timing.get(x[0], 0)
+            timing_y = self.timing.get(y[0], 0)
+            if timing_x < timing_y:
+                return -1
+            if timing_x == timing_y:
+                return 0
+            return 1
+
+        if self.config.options.time_scheduling:
+            tasks_queue.sort(cmp=comparator, reverse=True)
 
     def stop_workers(self):
         pass
@@ -922,6 +955,17 @@ class GeventedMultiProcessTestRunner(TextTestRunner):
         result = self._makeResult()
         start = time.time()
 
+        # load timing data:
+        self.timing = {}
+        if self.config.options.time_scheduling:
+            try:
+                f = open(self.config.options.timing_data_file, 'r')
+                for line in f:
+                    test_case, last_time_s = line.strip('\n').split(',')
+                    self.timing[test_case] = int(last_time_s)
+            except IOError, e:
+                sys.stderr.write("warning: no timing data found")
+
         # populates the queues
         self.collect_tasks(test, tasks_queue, remaining_tasks, to_teardown, result)
 
@@ -942,6 +986,16 @@ class GeventedMultiProcessTestRunner(TextTestRunner):
         ) # <-- blocks until all are done consuming the queue
 
         results_processor.join()
+
+        if self.config.options.time_scheduling:
+            for k, v in queue_manager.timing.iteritems():
+                self.timing[k] = v
+
+            f = open(self.config.options.timing_data_file, 'w')
+            for k, v in queue_manager.timing.iteritems():
+                f.write('{},{}\n'.format(k, int(v)))
+            f.close()
+
 
         # TODO: not call tests / set ups could have ran. see if we can prune the tearDown collection as result
         for case in to_teardown:
