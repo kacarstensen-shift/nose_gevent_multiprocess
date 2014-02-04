@@ -364,9 +364,9 @@ class TestProcessorTaskRunner(BaseTaskRunner):
             'get_setup_objects', self.worker_id)
 
         self._set_up_base_test_components(
-            pickle.loads(loaderClass_serialized),
-            pickle.loads(resultClass_serialized),
-            pickle.loads(config_serialized)
+            pickle.loads(str(loaderClass_serialized)),
+            pickle.loads(str(resultClass_serialized)),
+            pickle.loads(str(config_serialized))
         )
 
     @staticmethod
